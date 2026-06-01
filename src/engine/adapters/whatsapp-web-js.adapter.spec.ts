@@ -220,7 +220,7 @@ describe('WhatsAppWebJsAdapter', () => {
     });
     expect(patchSpy).toHaveBeenCalledTimes(1);
     expect(sendMessage).toHaveBeenCalledTimes(2);
-    expect(sendMessage).toHaveBeenNthCalledWith(2, '123@c.us', 'hello', undefined);
+    expect(sendMessage).toHaveBeenNthCalledWith(2, '123@c.us', 'hello', { waitUntilMsgSent: true });
     warnSpy.mockRestore();
   });
 
@@ -463,5 +463,6 @@ describe('WhatsAppWebJsAdapter', () => {
     await expect(adapter.sendTextMessage('123@c.us', 'hello')).rejects.toThrow(sendError);
     expect(patchSpy).not.toHaveBeenCalled();
     expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith('123@c.us', 'hello', { waitUntilMsgSent: true });
   });
 });

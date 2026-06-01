@@ -824,8 +824,9 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     content: MessageContent,
     options?: MessageSendOptions,
   ): Promise<WWebMessage> {
+    const reliableOptions = this.withReliableSendOptions(options);
     try {
-      return await this.client!.sendMessage(chatId, content, options);
+      return await this.client!.sendMessage(chatId, content, reliableOptions);
     } catch (error) {
       if (!this.isSendMessageCompatibilityError(error)) {
         throw error;
@@ -837,8 +838,15 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         error: error instanceof Error ? error.message : String(error),
       });
       await this.patchClientRuntimeCompatibility();
-      return this.client!.sendMessage(chatId, content, options);
+      return this.client!.sendMessage(chatId, content, reliableOptions);
     }
+  }
+
+  private withReliableSendOptions(options?: MessageSendOptions): MessageSendOptions {
+    return {
+      ...(options ?? {}),
+      waitUntilMsgSent: true,
+    };
   }
 
   async sendImageMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
