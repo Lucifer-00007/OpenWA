@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
 import {
+  Bot,
   Database,
   Server,
   HardDrive,
@@ -14,8 +15,9 @@ import {
   Gauge,
 } from 'lucide-react';
 import { infraApi } from '../services/api';
+import { automationApi } from '../services/api';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
-import { useInfraStatusQuery } from '../hooks/queries';
+import { useAutomationProvidersQuery, useInfraStatusQuery } from '../hooks/queries';
 import { PageHeader } from '../components/PageHeader';
 import { useToast } from '../components/Toast';
 import './Infrastructure.css';
@@ -88,7 +90,9 @@ export function Infrastructure() {
   useDocumentTitle(t('infrastructure.title'));
   const toast = useToast();
   const { data: infraStatus, isLoading: loading } = useInfraStatusQuery();
+  const { data: aiProviders = [], refetch: refetchAiProviders } = useAutomationProvidersQuery();
   const [saving, setSaving] = useState(false);
+  const [deletingProviderId, setDeletingProviderId] = useState<string | null>(null);
   const [showRestartModal, setShowRestartModal] = useState(false);
   const [restartCountdown, setRestartCountdown] = useState(0);
   const [restartStatus, setRestartStatus] = useState<'idle' | 'restarting' | 'waiting' | 'success' | 'error'>('idle');
@@ -154,6 +158,14 @@ export function Infrastructure() {
     ttl: 60,
     max: 100,
   });
+  const [aiProviderForm, setAiProviderForm] = useState({
+    name: '',
+    baseUrl: 'https://api.openai.com/v1',
+    apiKey: '',
+    defaultModel: 'gpt-4.1-mini',
+    timeoutMs: 15000,
+    maxRetries: 1,
+  });
 
   useEffect(() => {
     if (!infraStatus) return;
@@ -186,10 +198,7 @@ export function Infrastructure() {
 
   if (loading) {
     return (
-      <div
-        className="infrastructure-page"
-        style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '400px' }}
-      >
+      <div className="infrastructure-page infra-loading">
         <Loader2 className="animate-spin" size={32} />
       </div>
     );
@@ -233,6 +242,54 @@ export function Infrastructure() {
       toast.error(t('infrastructure.toasts.saveFailed'), err instanceof Error ? err.message : t('common.unknownError'));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleCreateAiProvider = async () => {
+    if (!aiProviderForm.name.trim() || !aiProviderForm.baseUrl.trim() || !aiProviderForm.defaultModel.trim()) return;
+    try {
+      await automationApi.createProvider({
+        ...aiProviderForm,
+        name: aiProviderForm.name.trim(),
+        baseUrl: aiProviderForm.baseUrl.trim(),
+        apiKey: aiProviderForm.apiKey.trim(),
+        defaultModel: aiProviderForm.defaultModel.trim(),
+      });
+      setAiProviderForm({
+        name: '',
+        baseUrl: 'https://api.openai.com/v1',
+        apiKey: '',
+        defaultModel: 'gpt-4.1-mini',
+        timeoutMs: 15000,
+        maxRetries: 1,
+      });
+      await refetchAiProviders();
+      toast.success('AI provider saved', 'Automations can now use this provider.');
+    } catch (err) {
+      toast.error('AI provider failed', err instanceof Error ? err.message : t('common.unknownError'));
+    }
+  };
+
+  const handleDeleteAiProvider = async (id: string, name: string) => {
+    if (!window.confirm(`Delete AI provider "${name}"? Automation rules using it will lose their provider assignment.`)) return;
+    setDeletingProviderId(id);
+    try {
+      await automationApi.deleteProvider(id);
+      await refetchAiProviders();
+      toast.success('AI provider deleted', `${name} was removed.`);
+    } catch (err) {
+      toast.error('Delete failed', err instanceof Error ? err.message : t('common.unknownError'));
+    } finally {
+      setDeletingProviderId(null);
+    }
+  };
+
+  const handleTestAiProvider = async (id: string) => {
+    try {
+      const result = await automationApi.testProvider(id, { message: 'Reply with ok' });
+      toast.success('Provider test passed', `${result.sample} (${result.latencyMs}ms)`);
+    } catch (err) {
+      toast.error('Provider test failed', err instanceof Error ? err.message : t('common.unknownError'));
     }
   };
 
@@ -292,11 +349,142 @@ export function Infrastructure() {
     setTimeout(check, 3000);
   };
 
+  const statusCards = [
+    {
+      label: t('infrastructure.database.title'),
+      value: dbConfig.type === 'postgres' ? 'PostgreSQL' : 'SQLite',
+      detail: infraStatus?.database.connected ? t('infrastructure.statusLabels.connected') : t('infrastructure.statusLabels.disconnected'),
+      state: infraStatus?.database.connected ? 'good' : 'bad',
+      icon: <Database size={18} />,
+    },
+    {
+      label: t('infrastructure.redis.title'),
+      value: redisEnabled ? `${redisConfig.host}:${redisConfig.port}` : t('infrastructure.statusLabels.disabled'),
+      detail: redisEnabled && redisConfig.connected ? t('infrastructure.statusLabels.connected') : t('infrastructure.statusLabels.disabled'),
+      state: redisEnabled && redisConfig.connected ? 'good' : 'muted',
+      icon: <Server size={18} />,
+    },
+    {
+      label: t('infrastructure.storage.title'),
+      value: storageConfig.type === 's3' ? 'Amazon S3' : 'Local',
+      detail: storageConfig.type === 's3' ? storageConfig.s3Bucket || 'S3 bucket' : storageConfig.localPath,
+      state: 'good',
+      icon: <HardDrive size={18} />,
+    },
+    {
+      label: 'Automation AI',
+      value: `${aiProviders.length} provider${aiProviders.length === 1 ? '' : 's'}`,
+      detail: `${aiProviders.filter(provider => provider.isActive).length} active`,
+      state: aiProviders.some(provider => provider.isActive) ? 'good' : 'muted',
+      icon: <Bot size={18} />,
+    },
+  ];
+
   return (
     <div className="infrastructure-page">
       <PageHeader title={t('infrastructure.title')} subtitle={t('infrastructure.subtitle')} />
 
+      <section className="infra-status-grid" aria-label="Infrastructure status">
+        {statusCards.map(card => (
+          <div className={`infra-status-card ${card.state}`} key={card.label}>
+            <div className="infra-status-icon">{card.icon}</div>
+            <div>
+              <span>{card.label}</span>
+              <strong>{card.value}</strong>
+              <small>{card.detail}</small>
+            </div>
+          </div>
+        ))}
+      </section>
+
       <div className="infra-sections">
+        <section className="infra-card infra-card--ai">
+          <div className="card-header">
+            <div className="header-left">
+              <Bot size={20} />
+              <h2>AI Providers</h2>
+            </div>
+          </div>
+          <p className="section-description">OpenAI-compatible providers for Automation replies.</p>
+          <div className="config-form">
+            <div className="form-row">
+              <div className="form-group">
+                <label>Name</label>
+                <input
+                  value={aiProviderForm.name}
+                  onChange={e => setAiProviderForm(prev => ({ ...prev, name: e.target.value }))}
+                  placeholder="OpenAI"
+                />
+              </div>
+              <div className="form-group">
+                <label>Base URL</label>
+                <input
+                  value={aiProviderForm.baseUrl}
+                  onChange={e => setAiProviderForm(prev => ({ ...prev, baseUrl: e.target.value }))}
+                />
+              </div>
+            </div>
+            <div className="form-row">
+              <div className="form-group">
+                <label>API Key</label>
+                <input
+                  type="password"
+                  value={aiProviderForm.apiKey}
+                  onChange={e => setAiProviderForm(prev => ({ ...prev, apiKey: e.target.value }))}
+                  placeholder="Optional"
+                />
+              </div>
+              <div className="form-group">
+                <label>Default Model</label>
+                <input
+                  value={aiProviderForm.defaultModel}
+                  onChange={e => setAiProviderForm(prev => ({ ...prev, defaultModel: e.target.value }))}
+                />
+              </div>
+            </div>
+            <button
+              className="btn-primary"
+              onClick={handleCreateAiProvider}
+              disabled={!aiProviderForm.name.trim() || !aiProviderForm.baseUrl.trim() || !aiProviderForm.defaultModel.trim()}
+            >
+              Add AI Provider
+            </button>
+          </div>
+          <div className="provider-list">
+            {aiProviders.length === 0 ? (
+              <div className="infra-inline-empty">No AI providers configured.</div>
+            ) : (
+              aiProviders.map(provider => (
+                <div className="provider-row" key={provider.id}>
+                  <div className="provider-main">
+                    <strong>{provider.name}</strong>
+                    <span className="provider-meta">
+                      {provider.baseUrl} · {provider.defaultModel} · {provider.hasApiKey ? 'API key saved' : 'No API key'}
+                    </span>
+                  </div>
+                  <div className="provider-actions">
+                    <span className={`status-indicator ${provider.isActive ? 'connected' : 'disconnected'}`}>
+                      ● {provider.isActive ? 'Active' : 'Disabled'}
+                    </span>
+                    <button className="btn-secondary" onClick={() => handleTestAiProvider(provider.id)}>
+                      Test
+                    </button>
+                    <button
+                      className="btn-danger-outline provider-delete-btn"
+                      onClick={() => handleDeleteAiProvider(provider.id, provider.name)}
+                      disabled={deletingProviderId === provider.id}
+                      title="Delete provider"
+                    >
+                      {deletingProviderId === provider.id ? <Loader2 className="animate-spin" size={16} /> : <Trash2 size={16} />}
+                      Delete
+                    </button>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </section>
+
         {/* Server Configuration */}
         <section className="infra-card">
           <div className="card-header">
@@ -387,8 +575,8 @@ export function Infrastructure() {
           </div>
 
           <div className="config-form">
-            <h3 style={{ margin: '0 0 1rem', fontSize: '0.9375rem', color: '#475569', fontWeight: 600 }}>
-              <Webhook size={16} style={{ marginInlineEnd: '0.5rem', verticalAlign: 'middle' }} />
+            <h3 className="infra-subsection-title">
+              <Webhook size={16} />
               {t('infrastructure.webhook.settings')}
             </h3>
             <div className="form-row">
@@ -420,9 +608,9 @@ export function Infrastructure() {
               </div>
             </div>
 
-            <div style={{ borderTop: '1px solid var(--border)', margin: '1.5rem 0', paddingTop: '1.5rem' }}>
-              <h3 style={{ margin: '0 0 1rem', fontSize: '0.9375rem', color: '#475569', fontWeight: 600 }}>
-                <Gauge size={16} style={{ marginInlineEnd: '0.5rem', verticalAlign: 'middle' }} />
+            <div className="infra-divider">
+              <h3 className="infra-subsection-title">
+                <Gauge size={16} />
                 {t('infrastructure.webhook.rateLimit')}
               </h3>
               <div className="form-row">
@@ -572,35 +760,16 @@ export function Infrastructure() {
 
           <div
             className="empty-state-card"
-            style={{
-              padding: '2.5rem',
-              textAlign: 'center',
-              background: '#F8FAFC',
-              borderRadius: '12px',
-              border: '1px dashed #E2E8F0',
-              marginTop: '1rem',
-            }}
           >
-            <Database size={32} style={{ color: '#22C55E', marginBottom: '1rem', opacity: 0.7 }} />
-            <p style={{ margin: 0, color: '#475569', fontSize: '0.9375rem', fontWeight: 500 }}>
+            <Database size={32} />
+            <p className="empty-state-title">
               {t('infrastructure.database.migrationsTitle')}
             </p>
-            <p
-              style={{
-                margin: '0.75rem 0 0',
-                color: '#22C55E',
-                fontSize: '0.875rem',
-                fontWeight: 500,
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: '0.375rem',
-              }}
-            >
+            <p className="empty-state-success">
               <CheckCircle size={16} />
               {t('infrastructure.database.migrationsStatus')}
             </p>
-            <p style={{ margin: '0.5rem 0 0', color: '#64748B', fontSize: '0.8125rem', lineHeight: 1.5 }}>
+            <p className="empty-state-copy">
               {t('infrastructure.database.migrationsHint')}
             </p>
           </div>
@@ -625,12 +794,7 @@ export function Infrastructure() {
           </div>
 
           <div
-            className="toggle-row"
-            style={{
-              borderBottom: redisEnabled ? '1px solid var(--border)' : 'none',
-              marginBottom: redisEnabled ? '1.5rem' : 0,
-              paddingBottom: redisEnabled ? '1.25rem' : 0,
-            }}
+            className={`toggle-row redis-enable-row ${redisEnabled ? 'is-enabled' : ''}`}
           >
             <div className="toggle-info">
               <span>{t('infrastructure.redis.enable')}</span>
@@ -768,22 +932,12 @@ export function Infrastructure() {
               )}
             </>
           ) : (
-            <div
-              className="empty-state-card"
-              style={{
-                padding: '2.5rem',
-                textAlign: 'center',
-                background: '#F8FAFC',
-                borderRadius: '12px',
-                border: '1px dashed #E2E8F0',
-                marginTop: '1rem',
-              }}
-            >
-              <Server size={32} style={{ color: '#94A3B8', marginBottom: '1rem', opacity: 0.5 }} />
-              <p style={{ margin: 0, color: '#475569', fontSize: '0.9375rem', fontWeight: 500 }}>
+            <div className="empty-state-card is-muted">
+              <Server size={32} />
+              <p className="empty-state-title">
                 {t('infrastructure.redis.disabledTitle')}
               </p>
-              <p style={{ margin: '0.5rem 0 0', color: '#64748B', fontSize: '0.8125rem', lineHeight: 1.5 }}>
+              <p className="empty-state-copy">
                 {t('infrastructure.redis.disabledDesc')}
               </p>
             </div>

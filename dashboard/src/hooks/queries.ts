@@ -6,7 +6,9 @@ import {
   auditApi,
   infraApi,
   pluginsApi,
+  automationApi,
   type Webhook,
+  type AutomationRule,
 } from '../services/api';
 
 // ── Query Keys ────────────────────────────────────────────────────────
@@ -23,6 +25,9 @@ export const queryKeys = {
   plugins: ['plugins'] as const,
   engines: ['engines'] as const,
   currentEngine: ['engines', 'current'] as const,
+  automationProviders: ['automation', 'providers'] as const,
+  automationRules: (params?: { sessionId?: string; active?: boolean; mode?: string }) => ['automation', 'rules', params] as const,
+  automationRuns: (params?: { sessionId?: string; ruleId?: string; status?: string }) => ['automation', 'runs', params] as const,
 };
 
 // ── Session Queries ───────────────────────────────────────────────────
@@ -226,5 +231,71 @@ export function useCurrentEngineQuery() {
     queryKey: queryKeys.currentEngine,
     queryFn: pluginsApi.getCurrentEngine,
     staleTime: 60_000,
+  });
+}
+
+// ── Automation Queries ───────────────────────────────────────────────
+
+export function useAutomationProvidersQuery() {
+  return useQuery({
+    queryKey: queryKeys.automationProviders,
+    queryFn: automationApi.listProviders,
+    staleTime: 30_000,
+  });
+}
+
+export function useAutomationRulesQuery(params?: { sessionId?: string; active?: boolean; mode?: string }) {
+  return useQuery({
+    queryKey: queryKeys.automationRules(params),
+    queryFn: () => automationApi.listRules(params),
+    staleTime: 15_000,
+  });
+}
+
+export function useAutomationRunsQuery(params?: { sessionId?: string; ruleId?: string; status?: string }) {
+  return useQuery({
+    queryKey: queryKeys.automationRuns(params),
+    queryFn: () => automationApi.listRuns({ ...params, limit: 25 }),
+    staleTime: 15_000,
+  });
+}
+
+export function useCreateAutomationRuleMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (data: Partial<AutomationRule>) => automationApi.createRule(data),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['automation', 'rules'] });
+    },
+  });
+}
+
+export function useUpdateAutomationRuleMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (params: { id: string; data: Partial<AutomationRule> }) => automationApi.updateRule(params.id, params.data),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['automation', 'rules'] });
+    },
+  });
+}
+
+export function useToggleAutomationRuleMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (params: { id: string; isActive: boolean }) => automationApi.toggleRule(params.id, params.isActive),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['automation', 'rules'] });
+    },
+  });
+}
+
+export function useDeleteAutomationRuleMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => automationApi.deleteRule(id),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['automation', 'rules'] });
+    },
   });
 }

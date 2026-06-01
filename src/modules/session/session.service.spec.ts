@@ -5,9 +5,11 @@ import { NotFoundException, ConflictException, BadRequestException } from '@nest
 import { SessionService } from './session.service';
 import { Session, SessionStatus } from './entities/session.entity';
 import { EngineFactory } from '../../engine/engine.factory';
+import { EngineStatus } from '../../engine/interfaces/whatsapp-engine.interface';
 import { EventsGateway } from '../events/events.gateway';
 import { WebhookService } from '../webhook/webhook.service';
 import { HookManager } from '../../core/hooks';
+import { AutomationRouterService } from '../automation/automation-router.service';
 
 function createMockSession(overrides: Partial<Session> = {}): Session {
   return {
@@ -35,6 +37,7 @@ describe('SessionService', () => {
   let eventsGateway: jest.Mocked<Partial<EventsGateway>>;
   let webhookService: jest.Mocked<Partial<WebhookService>>;
   let hookManager: jest.Mocked<Partial<HookManager>>;
+  let automationRouter: jest.Mocked<Partial<AutomationRouterService>>;
   let mockEngine: Record<string, jest.Mock>;
 
   beforeEach(async () => {
@@ -83,6 +86,10 @@ describe('SessionService', () => {
       execute: jest.fn().mockResolvedValue({ continue: true, data: {} }),
     };
 
+    automationRouter = {
+      processIncoming: jest.fn().mockResolvedValue(undefined),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         SessionService,
@@ -98,6 +105,7 @@ describe('SessionService', () => {
         { provide: EventsGateway, useValue: eventsGateway },
         { provide: WebhookService, useValue: webhookService },
         { provide: HookManager, useValue: hookManager },
+        { provide: AutomationRouterService, useValue: automationRouter },
       ],
     }).compile();
 
@@ -251,6 +259,72 @@ describe('SessionService', () => {
         expect.any(Object),
       );
     });
+
+    it('should not overwrite QR_READY when QR is generated during initialization', async () => {
+      const session = createMockSession();
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      mockEngine.initialize.mockImplementation(async (callbacks: { onQRCode?: () => void }) => {
+        callbacks.onQRCode?.();
+      });
+
+      await service.start('sess-uuid-1');
+      await new Promise(resolve => setImmediate(resolve));
+
+      const statusUpdates = (repository.update as jest.Mock).mock.calls
+        .filter(call => call[0] === 'sess-uuid-1' && call[1]?.status)
+        .map(call => call[1].status);
+
+      expect(statusUpdates).toEqual([SessionStatus.INITIALIZING, SessionStatus.QR_READY]);
+    });
+
+    it('should not overwrite READY when a stale AUTHENTICATING state arrives late', async () => {
+      const session = createMockSession();
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      mockEngine.initialize.mockImplementation(
+        async (callbacks: {
+          onReady?: (phone: string, pushName: string) => void;
+          onStateChanged?: (state: EngineStatus) => void;
+        }) => {
+          callbacks.onReady?.('918918131603', 'AP');
+          callbacks.onStateChanged?.(EngineStatus.AUTHENTICATING);
+        },
+      );
+
+      await service.start('sess-uuid-1');
+      await new Promise(resolve => setImmediate(resolve));
+
+      const statusUpdates = (repository.update as jest.Mock).mock.calls
+        .filter(call => call[0] === 'sess-uuid-1' && call[1]?.status)
+        .map(call => call[1].status);
+
+      expect(statusUpdates).toEqual([SessionStatus.INITIALIZING, SessionStatus.READY]);
+      expect(repository.update).toHaveBeenCalledWith(
+        'sess-uuid-1',
+        expect.objectContaining({
+          status: SessionStatus.READY,
+          phone: '918918131603',
+          pushName: 'AP',
+        }),
+      );
+    });
+
+    it('should clean up engine state if initialization fails', async () => {
+      const session = createMockSession();
+      const error = new Error('browser failed');
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      mockEngine.initialize.mockRejectedValue(error);
+
+      await expect(service.start('sess-uuid-1')).rejects.toThrow(error);
+
+      expect(service.isActive('sess-uuid-1')).toBe(false);
+      expect(mockEngine.destroy).toHaveBeenCalled();
+      expect(repository.update).toHaveBeenCalledWith('sess-uuid-1', {
+        status: SessionStatus.FAILED,
+      });
+    });
   });
 
   // ── stop ──────────────────────────────────────────────────────────
@@ -270,6 +344,7 @@ describe('SessionService', () => {
       expect(mockEngine.disconnect).toHaveBeenCalled();
       expect(repository.update).toHaveBeenCalledWith('sess-uuid-1', {
         status: SessionStatus.DISCONNECTED,
+        config: expect.objectContaining({ autoReconnect: false }),
       });
     });
   });
@@ -375,6 +450,23 @@ describe('SessionService', () => {
       expect(repository.update).toHaveBeenCalledWith(expect.objectContaining({ status: expect.anything() as string }), {
         status: SessionStatus.DISCONNECTED,
       });
+    });
+
+    it('should auto-reconnect previously linked sessions after bootstrap', async () => {
+      const linkedSession = createMockSession({
+        status: SessionStatus.DISCONNECTED,
+        connectedAt: new Date(),
+      });
+      (repository.find as jest.Mock).mockResolvedValue([linkedSession]);
+      (repository.findOne as jest.Mock).mockResolvedValue(linkedSession);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      await service.onModuleInit();
+      service.onApplicationBootstrap();
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(engineFactory.create).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'test-session' }));
+      expect(mockEngine.initialize).toHaveBeenCalled();
     });
   });
 

@@ -10,7 +10,16 @@ const API_BASE_URL = '/api';
 export interface Session {
   id: string;
   name: string;
-  status: 'created' | 'idle' | 'initializing' | 'connecting' | 'qr_ready' | 'ready' | 'disconnected';
+  status:
+    | 'created'
+    | 'idle'
+    | 'initializing'
+    | 'connecting'
+    | 'qr_ready'
+    | 'authenticating'
+    | 'ready'
+    | 'disconnected'
+    | 'failed';
   phone?: string;
   pushName?: string;
   lastActive?: string;
@@ -139,6 +148,75 @@ export interface Settings {
   general: { apiBaseUrl: string; sessionTimeout: number; autoReconnect: boolean; debugMode: boolean };
   api: { rateLimit: number; rateLimitWindow: number; enableDocs: boolean };
   notifications: { emailEnabled: boolean; notificationEmail: string; webhookAlerts: boolean };
+}
+
+export interface AutomationProvider {
+  id: string;
+  name: string;
+  baseUrl: string;
+  defaultModel: string;
+  isActive: boolean;
+  timeoutMs: number;
+  maxRetries: number;
+  hasApiKey: boolean;
+  headers: Record<string, string>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AutomationTarget {
+  targetType: 'contact' | 'group';
+  targetValue: string;
+  displayName?: string;
+}
+
+export interface AutomationTrigger {
+  id?: string;
+  pattern: string;
+  flags?: string;
+  replyText: string;
+  sortOrder?: number;
+}
+
+export interface AutomationRule {
+  id: string;
+  sessionId: string;
+  name: string;
+  description?: string;
+  isActive: boolean;
+  mode: 'regex' | 'ai';
+  targetScope: 'all' | 'all_contacts' | 'all_groups' | 'contacts' | 'groups';
+  priority: number;
+  cooldownSeconds: number;
+  replyDelayMs: number;
+  providerId?: string;
+  model?: string;
+  systemPrompt?: string;
+  userPromptTemplate?: string;
+  temperature?: number;
+  maxTokens?: number;
+  fallbackReply?: string;
+  targets: AutomationTarget[];
+  triggers: AutomationTrigger[];
+  lastTriggeredAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AutomationRun {
+  id: string;
+  ruleId?: string;
+  sessionId: string;
+  incomingMessageId?: string;
+  chatId: string;
+  senderId: string;
+  mode?: string;
+  status: string;
+  replyMessageId?: string;
+  errorCode?: string;
+  errorMessage?: string;
+  latencyMs?: number;
+  createdAt: string;
 }
 
 // =============================================================================
@@ -390,4 +468,94 @@ export const pluginsApi = {
   healthCheck: (id: string) => request<{ healthy: boolean; message?: string }>(`/plugins/${id}/health`),
   getEngines: () => request<Engine[]>('/infra/engines'),
   getCurrentEngine: () => request<{ engineType: string }>('/infra/engines/current'),
+};
+
+// =============================================================================
+// Automation API
+// =============================================================================
+
+export const automationApi = {
+  listProviders: () => request<AutomationProvider[]>('/automation/providers'),
+  createProvider: (data: {
+    name: string;
+    baseUrl: string;
+    apiKey?: string;
+    defaultModel: string;
+    headers?: Record<string, string>;
+    isActive?: boolean;
+    timeoutMs?: number;
+    maxRetries?: number;
+  }) =>
+    request<AutomationProvider>('/automation/providers', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  updateProvider: (
+    id: string,
+    data: Partial<AutomationProvider> & { apiKey?: string; headers?: Record<string, string> },
+  ) =>
+    request<AutomationProvider>(`/automation/providers/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  deleteProvider: (id: string) => request<void>(`/automation/providers/${id}`, { method: 'DELETE' }),
+  testProvider: (id: string, data: { model?: string; message?: string }) =>
+    request<{ success: boolean; latencyMs: number; model: string; sample: string }>(
+      `/automation/providers/${id}/test`,
+      {
+        method: 'POST',
+        body: JSON.stringify(data),
+      },
+    ),
+  listRules: (params?: { sessionId?: string; active?: boolean; mode?: string }) => {
+    const query = new URLSearchParams();
+    if (params?.sessionId) query.set('sessionId', params.sessionId);
+    if (params?.active !== undefined) query.set('active', String(params.active));
+    if (params?.mode) query.set('mode', params.mode);
+    const queryStr = query.toString();
+    return request<{ data: AutomationRule[]; total: number }>(`/automation/rules${queryStr ? `?${queryStr}` : ''}`);
+  },
+  createRule: (data: Partial<AutomationRule>) =>
+    request<AutomationRule>('/automation/rules', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  updateRule: (id: string, data: Partial<AutomationRule>) =>
+    request<AutomationRule>(`/automation/rules/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  toggleRule: (id: string, isActive: boolean) =>
+    request<AutomationRule>(`/automation/rules/${id}/toggle`, {
+      method: 'POST',
+      body: JSON.stringify({ isActive }),
+    }),
+  deleteRule: (id: string) => request<void>(`/automation/rules/${id}`, { method: 'DELETE' }),
+  testMatch: (data: { sessionId: string; chatId: string; from: string; body: string; isGroup?: boolean }) =>
+    request<{
+      matched: boolean;
+      ruleId?: string;
+      ruleName?: string;
+      mode?: string;
+      replyPreview?: string;
+      reason: string;
+    }>('/automation/rules/test-match', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  testAi: (id: string, data: { body: string; chatId?: string }) =>
+    request<{ success: boolean; latencyMs: number; reply: string }>(`/automation/rules/${id}/test-ai`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  listRuns: (params?: { sessionId?: string; ruleId?: string; status?: string; limit?: number; offset?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.sessionId) query.set('sessionId', params.sessionId);
+    if (params?.ruleId) query.set('ruleId', params.ruleId);
+    if (params?.status) query.set('status', params.status);
+    if (params?.limit) query.set('limit', String(params.limit));
+    if (params?.offset) query.set('offset', String(params.offset));
+    const queryStr = query.toString();
+    return request<{ data: AutomationRun[]; total: number }>(`/automation/runs${queryStr ? `?${queryStr}` : ''}`);
+  },
 };

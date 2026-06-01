@@ -25,6 +25,12 @@ export function Sessions() {
   const [statusFilter, setStatusFilter] = useState('all');
   const [selectedSession, setSelectedSession] = useState<Session | null>(null);
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  const normalizedSessionName = newSessionName.trim();
+  const hasInvalidSessionName = normalizedSessionName.length > 0 && !/^[a-z0-9-]+$/.test(normalizedSessionName);
+  const isSessionNameTooLong = normalizedSessionName.length > 50;
+  const hasDuplicateSessionName = sessions.some(s => s.name.toLowerCase() === normalizedSessionName.toLowerCase());
+  const canCreateSession =
+    normalizedSessionName.length > 0 && !hasInvalidSessionName && !isSessionNameTooLong && !hasDuplicateSessionName;
 
   useWebSocket({
     onSessionStatus: useCallback(
@@ -42,41 +48,49 @@ export function Sessions() {
     ),
   });
 
-  const fetchSessions = async () => {
-    try {
-      setLoading(true);
-      const data = await sessionApi.list();
-      setSessions(data);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : t('sessions.create.errorDefault'));
-    } finally {
-      setLoading(false);
-    }
-  };
+  const fetchSessions = useCallback(
+    async (options: { showLoading?: boolean } = {}) => {
+      const { showLoading = true } = options;
+
+      try {
+        if (showLoading) setLoading(true);
+        const data = await sessionApi.list();
+        setSessions(data);
+        setError(null);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : t('sessions.create.errorDefault'));
+      } finally {
+        if (showLoading) setLoading(false);
+      }
+    },
+    [t],
+  );
 
   useEffect(() => {
-    fetchSessions();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    void fetchSessions();
+  }, [fetchSessions]);
 
   const qrRefreshInterval = useRef<ReturnType<typeof setInterval> | null>(null);
   const currentSessionName = useRef<string>('');
 
-  const fetchQR = useCallback(async (sessionId: string) => {
-    try {
-      const qr = await sessionApi.getQR(sessionId);
-      setQrData({ sessionId, sessionName: currentSessionName.current, qrCode: qr.qrCode });
-      if (qr.status === 'ready') {
+  const fetchQR = useCallback(
+    async (sessionId: string) => {
+      try {
+        const qr = await sessionApi.getQR(sessionId);
+        setQrData({ sessionId, sessionName: currentSessionName.current, qrCode: qr.qrCode });
+        if (qr.status === 'ready') {
+          setQrData(null);
+          currentSessionName.current = '';
+          void fetchSessions({ showLoading: false });
+        }
+      } catch {
         setQrData(null);
         currentSessionName.current = '';
-        fetchSessions();
+        void fetchSessions({ showLoading: false });
       }
-    } catch {
-      setQrData(null);
-      currentSessionName.current = '';
-      fetchSessions();
-    }
-  }, []);
+    },
+    [fetchSessions],
+  );
 
   useEffect(() => {
     if (qrData) {
@@ -90,15 +104,38 @@ export function Sessions() {
     };
   }, [qrData, fetchQR]);
 
+  const mergeSession = (session: Session) => {
+    setSessions(prev => [session, ...prev.filter(item => item.id !== session.id)]);
+  };
+
+  const removeSession = (id: string) => {
+    setSessions(prev => prev.filter(session => session.id !== id));
+  };
+
+  const updateSessionStatus = (id: string, status: Session['status']) => {
+    setSessions(prev => prev.map(session => (session.id === id ? { ...session, status } : session)));
+  };
+
+  const closeCreateModal = () => {
+    if (creating) return;
+    setShowCreateModal(false);
+    setNewSessionName('');
+  };
+
   const handleCreate = async () => {
-    if (!newSessionName.trim()) return;
+    if (!canCreateSession || creating) return;
+
     try {
       setCreating(true);
-      const newSession = await sessionApi.create(newSessionName);
-      setSessions([...sessions, newSession]);
+      setError(null);
+      const newSession = await sessionApi.create(normalizedSessionName);
+      mergeSession(newSession);
+      setSearchQuery('');
+      setStatusFilter('all');
       setNewSessionName('');
       setShowCreateModal(false);
       toast.success(t('sessions.create.successTitle'), t('sessions.create.successDesc', { name: newSession.name }));
+      void fetchSessions({ showLoading: false });
     } catch (err) {
       const msg = err instanceof Error ? err.message : t('sessions.create.errorDefault');
       setError(msg);
@@ -112,10 +149,12 @@ export function Sessions() {
     const session = sessions.find(s => s.id === id);
     try {
       await sessionApi.delete(id);
-      setSessions(sessions.filter(s => s.id !== id));
+      removeSession(id);
       toast.success(
         t('sessions.delete.successTitle'),
-        session ? t('sessions.delete.successDescNamed', { name: session.name }) : t('sessions.delete.successDescGeneric'),
+        session
+          ? t('sessions.delete.successDescNamed', { name: session.name })
+          : t('sessions.delete.successDescGeneric'),
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : t('sessions.delete.errorDefault');
@@ -128,19 +167,19 @@ export function Sessions() {
 
   const handleStart = async (id: string) => {
     const session = sessions.find(s => s.id === id);
-    if (session && ['initializing', 'connecting', 'qr_ready'].includes(session.status)) {
+    if (session && ['initializing', 'connecting', 'qr_ready', 'authenticating'].includes(session.status)) {
       handleShowQR(id);
       return;
     }
 
     try {
       await sessionApi.start(id);
-      setSessions(sessions.map(s => (s.id === id ? { ...s, status: 'connecting' } : s)));
-      await fetchSessions();
+      updateSessionStatus(id, 'connecting');
+      await fetchSessions({ showLoading: false });
       handleShowQR(id);
     } catch (err) {
       console.error('Failed to start:', err);
-      await fetchSessions();
+      await fetchSessions({ showLoading: false });
       if (err instanceof Error && err.message.includes('already started')) {
         handleShowQR(id);
       }
@@ -162,11 +201,11 @@ export function Sessions() {
   const handleStop = async (id: string) => {
     try {
       await sessionApi.stop(id);
-      setSessions(sessions.map(s => (s.id === id ? { ...s, status: 'disconnected' } : s)));
+      updateSessionStatus(id, 'disconnected');
       if (qrData?.sessionId === id) setQrData(null);
     } catch (err) {
       console.error('Failed to stop:', err);
-      fetchSessions();
+      void fetchSessions({ showLoading: false });
     }
   };
 
@@ -187,8 +226,9 @@ export function Sessions() {
     const matchesStatus =
       statusFilter === 'all' ||
       (statusFilter === 'active' && s.status === 'ready') ||
-      (statusFilter === 'inactive' && ['created', 'idle', 'disconnected'].includes(s.status)) ||
-      (statusFilter === 'connecting' && ['initializing', 'connecting', 'qr_ready'].includes(s.status));
+      (statusFilter === 'inactive' && ['created', 'idle', 'disconnected', 'failed'].includes(s.status)) ||
+      (statusFilter === 'connecting' &&
+        ['initializing', 'connecting', 'qr_ready', 'authenticating'].includes(s.status));
     return matchesSearch && matchesStatus;
   });
 
@@ -255,11 +295,11 @@ export function Sessions() {
       )}
 
       {showCreateModal && (
-        <div className="modal-overlay" onClick={() => setShowCreateModal(false)}>
+        <div className="modal-overlay" onClick={closeCreateModal}>
           <div className="modal" onClick={e => e.stopPropagation()}>
             <div className="modal-header">
               <h2>{t('sessions.create.title')}</h2>
-              <button className="btn-icon" onClick={() => setShowCreateModal(false)}>
+              <button className="btn-icon" onClick={closeCreateModal} disabled={creating}>
                 <X size={20} />
               </button>
             </div>
@@ -273,38 +313,38 @@ export function Sessions() {
                   const value = e.target.value.toLowerCase().replace(/\s+/g, '-');
                   setNewSessionName(value);
                 }}
-                onKeyDown={e => e.key === 'Enter' && handleCreate()}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') {
+                    void handleCreate();
+                  }
+                }}
               />
-              <p className="input-hint">
-                <Trans i18nKey="sessions.create.hint" components={{ code: <code /> }} />
-              </p>
-              {newSessionName && !/^[a-z0-9-]+$/.test(newSessionName) && (
+              <div className="input-hint">
+                <span>{t('sessions.create.hint')}</span>
+                <span className="input-examples" aria-label={t('sessions.create.examplesLabel')}>
+                  <span className="input-examples-label">{t('sessions.create.examplesLabel')}:</span>
+                  <code>customer-support</code>
+                  <code>bot-1</code>
+                </span>
+              </div>
+              {normalizedSessionName && hasInvalidSessionName && (
                 <p className="input-error">{t('sessions.create.invalidChars')}</p>
               )}
-              {newSessionName && newSessionName.length > 50 && (
-                <p className="input-error">{t('sessions.create.tooLong', { length: newSessionName.length })}</p>
+              {normalizedSessionName && isSessionNameTooLong && (
+                <p className="input-error">{t('sessions.create.tooLong', { length: normalizedSessionName.length })}</p>
               )}
-              {newSessionName &&
-                /^[a-z0-9-]+$/.test(newSessionName) &&
-                newSessionName.length <= 50 &&
-                sessions.some(s => s.name === newSessionName) && (
-                  <p className="input-error">{t('sessions.create.duplicate')}</p>
-                )}
+              {normalizedSessionName && !hasInvalidSessionName && !isSessionNameTooLong && hasDuplicateSessionName && (
+                <p className="input-error">{t('sessions.create.duplicate')}</p>
+              )}
             </div>
             <div className="modal-footer">
-              <button className="btn-secondary" onClick={() => setShowCreateModal(false)}>
+              <button className="btn-secondary" onClick={closeCreateModal} disabled={creating}>
                 {t('common.cancel')}
               </button>
               <button
                 className="btn-primary"
-                onClick={handleCreate}
-                disabled={
-                  creating ||
-                  !newSessionName.trim() ||
-                  !/^[a-z0-9-]+$/.test(newSessionName) ||
-                  newSessionName.length > 50 ||
-                  sessions.some(s => s.name === newSessionName)
-                }
+                onClick={() => void handleCreate()}
+                disabled={creating || !canCreateSession}
               >
                 {creating ? <Loader2 className="animate-spin" size={16} /> : t('common.create')}
               </button>
@@ -330,9 +370,15 @@ export function Sessions() {
                 <>
                   <img src={qrData.qrCode} alt="QR" style={{ maxWidth: '280px', borderRadius: '12px' }} />
                   <div className="qr-instructions">
-                    <p className="qr-step"><Trans i18nKey="sessions.qr.step1" components={{ strong: <strong /> }} /></p>
-                    <p className="qr-step"><Trans i18nKey="sessions.qr.step2" components={{ strong: <strong /> }} /></p>
-                    <p className="qr-step"><Trans i18nKey="sessions.qr.step3" components={{ strong: <strong /> }} /></p>
+                    <p className="qr-step">
+                      <Trans i18nKey="sessions.qr.step1" components={{ strong: <strong /> }} />
+                    </p>
+                    <p className="qr-step">
+                      <Trans i18nKey="sessions.qr.step2" components={{ strong: <strong /> }} />
+                    </p>
+                    <p className="qr-step">
+                      <Trans i18nKey="sessions.qr.step3" components={{ strong: <strong /> }} />
+                    </p>
                   </div>
                   <p className="qr-auto-refresh">
                     <RefreshCw size={14} className="spin-slow" /> {t('sessions.qr.autoRefresh')}
@@ -366,7 +412,9 @@ export function Sessions() {
                 </div>
                 <div className="detail-item">
                   <span className="detail-label">{t('sessions.details.status')}</span>
-                  <span className={`status-badge ${selectedSession.status}`}>{formatStatus(selectedSession.status)}</span>
+                  <span className={`status-badge ${selectedSession.status}`}>
+                    {formatStatus(selectedSession.status)}
+                  </span>
                 </div>
                 <div className="detail-item">
                   <span className="detail-label">{t('sessions.details.sessionId')}</span>
@@ -383,7 +431,9 @@ export function Sessions() {
                 <div className="detail-item">
                   <span className="detail-label">{t('sessions.details.lastActive')}</span>
                   <span className="detail-value">
-                    {selectedSession.lastActive ? new Date(selectedSession.lastActive).toLocaleString() : t('common.never')}
+                    {selectedSession.lastActive
+                      ? new Date(selectedSession.lastActive).toLocaleString()
+                      : t('common.never')}
                   </span>
                 </div>
               </div>
@@ -443,7 +493,7 @@ export function Sessions() {
                 <span className={`status-pill ${session.status}`}>{formatStatus(session.status)}</span>
               </div>
 
-              {session.status === 'initializing' || session.status === 'connecting' || session.status === 'qr_ready' ? (
+              {['initializing', 'connecting', 'qr_ready', 'authenticating'].includes(session.status) ? (
                 <div className="qr-placeholder">
                   <QrCode size={80} className="qr-icon" />
                   <p>{session.status === 'qr_ready' ? t('sessions.qr.scanToConnect') : t('sessions.qr.preparing')}</p>
@@ -478,12 +528,16 @@ export function Sessions() {
                   {t('sessions.actions.view')}
                 </button>
                 {canWrite &&
-                (session.status === 'created' || session.status === 'idle' || session.status === 'disconnected') ? (
+                (session.status === 'created' ||
+                  session.status === 'idle' ||
+                  session.status === 'disconnected' ||
+                  session.status === 'failed') ? (
                   <button className="btn-action" onClick={() => handleStart(session.id)}>
                     <Play size={16} />
                     {t('sessions.actions.start')}
                   </button>
-                ) : canWrite && ['ready', 'initializing', 'connecting', 'qr_ready'].includes(session.status) ? (
+                ) : canWrite &&
+                  ['ready', 'initializing', 'connecting', 'qr_ready', 'authenticating'].includes(session.status) ? (
                   <button className="btn-action" onClick={() => handleStop(session.id)}>
                     <Square size={16} />
                     {t('sessions.actions.stop')}

@@ -1,5 +1,14 @@
 import { EventEmitter } from 'events';
-import { Client, LocalAuth, MessageMedia } from 'whatsapp-web.js';
+import {
+  Chat as WWebChat,
+  Client,
+  Events,
+  LocalAuth,
+  Message as WWebMessage,
+  MessageMedia,
+  type MessageContent,
+  type MessageSendOptions,
+} from 'whatsapp-web.js';
 import * as qrcode from 'qrcode';
 import * as path from 'path';
 import {
@@ -50,6 +59,34 @@ export interface WhatsAppWebJsConfig {
   };
 }
 
+type InjectableWhatsAppClient = Client & {
+  inject?: () => Promise<void>;
+};
+
+type WhatsAppRuntimePage = {
+  evaluate<T>(pageFunction: () => T | Promise<T>): Promise<T>;
+};
+
+type WhatsAppRuntimeClient = Client & {
+  pupPage?: WhatsAppRuntimePage;
+};
+
+type WhatsAppRuntimeConnectionInfo = {
+  connected: boolean;
+  hasWWebJS: boolean;
+  phoneNumber?: string | null;
+  pushName?: string | null;
+  socketState?: string | null;
+};
+
+const RECENT_UNREAD_RECOVERY_WINDOW_SECONDS = 120;
+const RECENT_MESSAGE_SCAN_INTERVAL_MS = 5000;
+const RECENT_MESSAGE_SCAN_LOOKBACK_SECONDS = 90;
+const MAX_RECENT_MESSAGE_SCAN_CHATS = 25;
+const MAX_RECENT_MESSAGE_SCAN_MESSAGES_PER_CHAT = 5;
+const MAX_RECOVERED_MESSAGES_PER_CHAT = 20;
+const MAX_PROCESSED_MESSAGE_IDS = 1000;
+
 export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngine {
   private client: Client | null = null;
   private status: EngineStatus = EngineStatus.DISCONNECTED;
@@ -57,6 +94,11 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   private phoneNumber: string | null = null;
   private pushName: string | null = null;
   private callbacks: EngineEventCallbacks = {};
+  private readyEmitted = false;
+  private readyRecoveryTimers: NodeJS.Timeout[] = [];
+  private recentMessageScanTimer: NodeJS.Timeout | null = null;
+  private recoverySinceTimestamp = 0;
+  private readonly processedIncomingMessageIds = new Set<string>();
 
   constructor(private readonly config: WhatsAppWebJsConfig) {
     super();
@@ -66,18 +108,23 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   async initialize(callbacks: EngineEventCallbacks): Promise<void> {
     this.callbacks = callbacks;
+    this.stopRecentMessageScanner();
+    this.recoverySinceTimestamp = Math.floor(Date.now() / 1000) - RECENT_UNREAD_RECOVERY_WINDOW_SECONDS;
+    this.processedIncomingMessageIds.clear();
     this.setStatus(EngineStatus.INITIALIZING);
 
     try {
       // Build puppeteer args, including proxy if configured
-      const puppeteerArgs = this.config.puppeteer?.args || [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--disable-gpu',
+      const puppeteerArgs = [
+        ...(this.config.puppeteer?.args ?? [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas',
+          '--no-first-run',
+          '--no-zygote',
+          '--disable-gpu',
+        ]),
       ];
 
       // Add proxy configuration if provided
@@ -99,12 +146,241 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         },
       });
 
+      this.patchClientInjection(this.client);
       this.setupEventHandlers();
       await this.client.initialize();
+      this.scheduleReadyRecovery();
     } catch (error) {
       this.setStatus(EngineStatus.FAILED);
       throw error;
     }
+  }
+
+  private patchClientInjection(client: Client): void {
+    const injectableClient = client as InjectableWhatsAppClient;
+    const originalInject = injectableClient.inject?.bind(client);
+    if (!originalInject) return;
+
+    injectableClient.inject = async (): Promise<void> => {
+      const maxAttempts = 3;
+
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          await originalInject();
+          await this.patchClientRuntimeCompatibility();
+          return;
+        } catch (error) {
+          if (!this.isNavigationRaceError(error)) {
+            throw error;
+          }
+
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          const canRetry = attempt < maxAttempts;
+          this.logger.warn('WhatsApp Web injection raced with page navigation', {
+            sessionId: this.config.sessionId,
+            attempt,
+            maxAttempts,
+            retrying: canRetry,
+            error: errorMessage,
+            action: 'client_inject_navigation_race',
+          });
+
+          if (!canRetry) return;
+          await this.delay(250 * attempt);
+        }
+      }
+    };
+  }
+
+  private async patchClientRuntimeCompatibility(): Promise<void> {
+    const runtimeClient = this.client as WhatsAppRuntimeClient | null;
+    const page = runtimeClient?.pupPage;
+    if (!page) return;
+
+    try {
+      await page.evaluate(() => {
+        type SendMessageFn = ((...args: unknown[]) => Promise<unknown>) & {
+          __openwaCompatPatched?: boolean;
+        };
+
+        type WhatsAppBrowserWindow = Window & {
+          WWebJS?: {
+            sendMessage?: SendMessageFn;
+          };
+          require?: (moduleName: string) => unknown;
+          __openwaSendMessageCompatPatched?: boolean;
+        };
+
+        const browserWindow = window as WhatsAppBrowserWindow;
+
+        const originalSendMessage = browserWindow.WWebJS?.sendMessage;
+        if (typeof originalSendMessage !== 'function' || originalSendMessage.__openwaCompatPatched) return;
+
+        const patchedSendMessage: SendMessageFn = async function patchedSendMessage(this: unknown, ...args: unknown[]) {
+          try {
+            const gatingUtils = browserWindow.require?.('WAWebStatusGatingUtils') as
+              | {
+                  canCheckStatusRankingPosterGating?: () => boolean;
+                }
+              | undefined;
+
+            if (gatingUtils && typeof gatingUtils.canCheckStatusRankingPosterGating !== 'function') {
+              gatingUtils.canCheckStatusRankingPosterGating = () => false;
+            }
+          } catch {
+            // WhatsApp module names change frequently; sendMessage can still work without this guard.
+          }
+
+          return originalSendMessage.apply(this, args);
+        };
+
+        patchedSendMessage.__openwaCompatPatched = true;
+        browserWindow.WWebJS!.sendMessage = patchedSendMessage;
+        browserWindow.__openwaSendMessageCompatPatched = true;
+      });
+    } catch (error) {
+      this.logger.debug('Unable to patch WhatsApp Web runtime compatibility', {
+        sessionId: this.config.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private scheduleReadyRecovery(): void {
+    this.clearReadyRecoveryTimers();
+    for (const delayMs of [3000, 10000, 30000]) {
+      this.readyRecoveryTimers.push(
+        setTimeout(() => {
+          void this.recoverReadyFromConnectedRuntime();
+        }, delayMs),
+      );
+    }
+  }
+
+  private clearReadyRecoveryTimers(): void {
+    for (const timer of this.readyRecoveryTimers) {
+      clearTimeout(timer);
+    }
+    this.readyRecoveryTimers = [];
+  }
+
+  private async recoverReadyFromConnectedRuntime(): Promise<void> {
+    if (this.readyEmitted || this.status === EngineStatus.READY || !this.client) return;
+
+    const runtimeInfo = await this.getRuntimeConnectionInfo();
+    if (!runtimeInfo?.connected || !runtimeInfo.hasWWebJS) return;
+
+    this.logger.warn('Recovering WhatsApp ready state from connected runtime', {
+      sessionId: this.config.sessionId,
+      socketState: runtimeInfo.socketState,
+      action: 'ready_state_recovery',
+    });
+
+    this.markReady(runtimeInfo.phoneNumber, runtimeInfo.pushName);
+  }
+
+  private async getRuntimeConnectionInfo(): Promise<WhatsAppRuntimeConnectionInfo | null> {
+    const runtimeClient = this.client as WhatsAppRuntimeClient | null;
+    const page = runtimeClient?.pupPage;
+    if (!page) return null;
+
+    try {
+      return page.evaluate(() => {
+        type WhatsAppBrowserWindow = Window & {
+          WWebJS?: unknown;
+          require?: (moduleName: string) => unknown;
+        };
+        type WhatsAppWidLike = {
+          user?: string;
+          _serialized?: string;
+          toString?: () => string;
+        };
+        type WhatsAppConnModel = {
+          serialize?: () => {
+            pushname?: string;
+            pushName?: string;
+            wid?: WhatsAppWidLike;
+          };
+        };
+
+        const browserWindow = window as WhatsAppBrowserWindow;
+        const getSerializedUser = (value: unknown): string | null => {
+          if (!value) return null;
+          if (typeof value === 'string') return value.replace(/@.+$/, '');
+          const wid = value as WhatsAppWidLike;
+          if (wid.user) return wid.user;
+          if (wid._serialized) return wid._serialized.replace(/@.+$/, '');
+          const stringValue = wid.toString?.();
+          return stringValue && stringValue !== '[object Object]' ? stringValue.replace(/@.+$/, '') : null;
+        };
+
+        let socketState: string | null = null;
+        let phoneNumber: string | null = null;
+        let pushName: string | null = null;
+
+        try {
+          socketState = ((browserWindow.require?.('WAWebSocketModel') as { Socket?: { state?: string } } | undefined)
+            ?.Socket?.state ?? null) as string | null;
+        } catch {
+          socketState = null;
+        }
+
+        try {
+          const conn = browserWindow.require?.('WAWebConnModel') as { Conn?: WhatsAppConnModel } | undefined;
+          const serialized = conn?.Conn?.serialize?.();
+          phoneNumber = getSerializedUser(serialized?.wid);
+          pushName = serialized?.pushname ?? serialized?.pushName ?? null;
+        } catch {
+          // Runtime module names change frequently; user prefs below is a second source.
+        }
+
+        try {
+          const userPrefs = browserWindow.require?.('WAWebUserPrefsMeUser') as
+            | {
+                getMaybeMePnUser?: () => unknown;
+                getMaybeMeLidUser?: () => unknown;
+              }
+            | undefined;
+          phoneNumber ||= getSerializedUser(userPrefs?.getMaybeMePnUser?.());
+          phoneNumber ||= getSerializedUser(userPrefs?.getMaybeMeLidUser?.());
+        } catch {
+          // Keep null phone if WhatsApp internals changed.
+        }
+
+        return {
+          connected: socketState === 'CONNECTED',
+          hasWWebJS: typeof browserWindow.WWebJS !== 'undefined',
+          phoneNumber,
+          pushName,
+          socketState,
+        };
+      });
+    } catch (error) {
+      this.logger.debug('Unable to inspect WhatsApp Web runtime readiness', {
+        sessionId: this.config.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  private isNavigationRaceError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return (
+      message.includes('Execution context was destroyed') ||
+      message.includes('most likely because of a navigation') ||
+      message.includes('Cannot find context with specified id') ||
+      message.includes('Navigating frame was detached')
+    );
+  }
+
+  private isSendMessageCompatibilityError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return message.includes('canCheckStatusRankingPosterGating is not a function');
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   private setupEventHandlers(): void {
@@ -122,75 +398,41 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     });
 
     this.client.on('authenticated', () => {
-      this.setStatus(EngineStatus.AUTHENTICATING);
+      if (this.status !== EngineStatus.READY) {
+        this.setStatus(EngineStatus.AUTHENTICATING);
+      }
       this.qrCode = null;
     });
 
     this.client.on('ready', () => {
       try {
         const info = this.client?.info;
-        this.phoneNumber = info?.wid?.user || null;
-        this.pushName = info?.pushname || null;
-        this.setStatus(EngineStatus.READY);
-        this.callbacks.onReady?.(this.phoneNumber || '', this.pushName || '');
+        this.markReady(info?.wid?.user, info?.pushname);
       } catch (error) {
         this.logger.error('Error getting client info', String(error));
-        this.setStatus(EngineStatus.READY);
-        this.callbacks.onReady?.('', '');
+        this.markReady();
       }
     });
 
     // eslint-disable-next-line @typescript-eslint/no-misused-promises
-    this.client.on('message', async msg => {
-      try {
-        const incomingMessage: IncomingMessage = {
-          id: msg.id._serialized,
-          from: msg.from,
-          to: msg.to,
-          chatId: msg.from,
-          body: msg.body,
-          type: msg.type,
-          timestamp: msg.timestamp,
-          fromMe: msg.fromMe,
-          isGroup: msg.from.endsWith('@g.us'),
-        };
+    this.client.on(Events.MESSAGE_CREATE, async msg => {
+      await this.handleCreatedMessage(msg, 'message_create');
+    });
 
-        // Handle media
-        if (msg.hasMedia) {
-          try {
-            const media = await msg.downloadMedia();
-            if (media) {
-              incomingMessage.media = {
-                mimetype: media.mimetype,
-                filename: media.filename || undefined,
-                data: media.data,
-              };
-            }
-          } catch (error) {
-            this.logger.error('Error downloading media', String(error));
-          }
-        }
-
-        // Handle quoted message
-        if (msg.hasQuotedMsg) {
-          try {
-            const quoted = await msg.getQuotedMessage();
-            incomingMessage.quotedMessage = {
-              id: quoted.id._serialized,
-              body: quoted.body,
-            };
-          } catch (error) {
-            this.logger.error('Error getting quoted message', String(error));
-          }
-        }
-
-        this.callbacks.onMessage?.(incomingMessage);
-      } catch (error) {
-        this.logger.error('Error processing incoming message', String(error));
-      }
+    // eslint-disable-next-line @typescript-eslint/no-misused-promises
+    this.client.on(Events.MESSAGE_RECEIVED, async msg => {
+      await this.emitIncomingMessage(msg, 'message');
     });
 
     this.client.on('message_ack', (msg, ack) => {
+      this.logger.log('WhatsApp message ACK received', {
+        sessionId: this.config.sessionId,
+        messageId: msg.id?._serialized,
+        chatId: msg.fromMe ? msg.to : msg.from,
+        fromMe: msg.fromMe,
+        ack,
+        action: 'whatsapp_message_ack',
+      });
       this.callbacks.onMessageAck?.(msg.id._serialized, ack);
     });
 
@@ -206,12 +448,247 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   }
 
   private setStatus(status: EngineStatus): void {
+    if (this.status === EngineStatus.READY && this.isTransientPreReadyStatus(status)) {
+      this.logger.debug('Ignoring stale WhatsApp pre-ready status after ready', {
+        sessionId: this.config.sessionId,
+        status,
+        action: 'stale_status_ignored',
+      });
+      return;
+    }
+
     this.status = status;
+    if (status === EngineStatus.READY) {
+      this.clearReadyRecoveryTimers();
+    } else {
+      this.stopRecentMessageScanner();
+    }
     this.callbacks.onStateChanged?.(status);
     this.emit('stateChanged', status);
   }
 
+  private isTransientPreReadyStatus(status: EngineStatus): boolean {
+    return (
+      status === EngineStatus.INITIALIZING || status === EngineStatus.AUTHENTICATING || status === EngineStatus.QR_READY
+    );
+  }
+
+  private markReady(phoneNumber?: string | null, pushName?: string | null): void {
+    if (this.readyEmitted) return;
+
+    this.readyEmitted = true;
+    this.qrCode = null;
+    this.phoneNumber = phoneNumber || this.phoneNumber || null;
+    this.pushName = pushName || this.pushName || null;
+    this.setStatus(EngineStatus.READY);
+    this.callbacks.onReady?.(this.phoneNumber || '', this.pushName || '');
+    void this.recoverRecentUnreadMessages();
+    this.startRecentMessageScanner();
+  }
+
+  private async handleCreatedMessage(msg: WWebMessage, source: string): Promise<void> {
+    if (msg.fromMe) return;
+    await this.emitIncomingMessage(msg, source);
+  }
+
+  private async emitIncomingMessage(msg: WWebMessage, source: string = 'unknown'): Promise<boolean> {
+    if (msg.fromMe) return false;
+    if (!this.rememberIncomingMessage(msg.id?._serialized)) return false;
+
+    try {
+      const incomingMessage: IncomingMessage = {
+        id: msg.id._serialized,
+        from: msg.from,
+        to: msg.to,
+        chatId: msg.from,
+        contactIds: await this.resolveMessageContactIds(msg),
+        body: msg.body,
+        type: msg.type,
+        timestamp: msg.timestamp,
+        fromMe: msg.fromMe,
+        isGroup: msg.from.endsWith('@g.us'),
+      };
+
+      this.logger.log('WhatsApp incoming message normalized', {
+        sessionId: this.config.sessionId,
+        source,
+        messageId: incomingMessage.id,
+        from: incomingMessage.from,
+        to: incomingMessage.to,
+        chatId: incomingMessage.chatId,
+        contactIds: incomingMessage.contactIds,
+        type: incomingMessage.type,
+        bodyLength: incomingMessage.body?.length ?? 0,
+        isGroup: incomingMessage.isGroup,
+        action: 'whatsapp_incoming_message_normalized',
+      });
+
+      // Handle media
+      if (msg.hasMedia) {
+        try {
+          const media = await msg.downloadMedia();
+          if (media) {
+            incomingMessage.media = {
+              mimetype: media.mimetype,
+              filename: media.filename || undefined,
+              data: media.data,
+            };
+          }
+        } catch (error) {
+          this.logger.error('Error downloading media', String(error));
+        }
+      }
+
+      // Handle quoted message
+      if (msg.hasQuotedMsg) {
+        try {
+          const quoted = await msg.getQuotedMessage();
+          incomingMessage.quotedMessage = {
+            id: quoted.id._serialized,
+            body: quoted.body,
+          };
+        } catch (error) {
+          this.logger.error('Error getting quoted message', String(error));
+        }
+      }
+
+      this.callbacks.onMessage?.(incomingMessage);
+      return true;
+    } catch (error) {
+      this.logger.error('Error processing incoming message', String(error));
+      return false;
+    }
+  }
+
+  private async recoverRecentUnreadMessages(): Promise<void> {
+    const client = this.client;
+    if (!client) return;
+
+    try {
+      const chats = (await client.getChats()) as WWebChat[];
+      let recoveredCount = 0;
+
+      for (const chat of chats) {
+        if (!this.shouldRecoverUnreadChat(chat)) continue;
+
+        const limit = Math.min(Math.max(chat.unreadCount, 1), MAX_RECOVERED_MESSAGES_PER_CHAT);
+        const messages = await chat.fetchMessages({ limit });
+        for (const msg of messages) {
+          if (msg.fromMe || msg.timestamp < this.recoverySinceTimestamp) continue;
+          if (await this.emitIncomingMessage(msg, 'recent_unread_recovery')) {
+            recoveredCount += 1;
+          }
+        }
+      }
+
+      if (recoveredCount > 0) {
+        this.logger.log('Recovered recent unread WhatsApp messages', {
+          sessionId: this.config.sessionId,
+          count: recoveredCount,
+          action: 'recent_unread_recovery',
+        });
+      }
+    } catch (error) {
+      this.logger.warn('Recent unread message recovery failed', {
+        sessionId: this.config.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private startRecentMessageScanner(): void {
+    this.stopRecentMessageScanner();
+    this.logger.log('WhatsApp recent message scanner started', {
+      sessionId: this.config.sessionId,
+      intervalMs: RECENT_MESSAGE_SCAN_INTERVAL_MS,
+      lookbackSeconds: RECENT_MESSAGE_SCAN_LOOKBACK_SECONDS,
+      action: 'recent_message_scanner_started',
+    });
+    void this.scanRecentMessages();
+    this.recentMessageScanTimer = setInterval(() => {
+      void this.scanRecentMessages();
+    }, RECENT_MESSAGE_SCAN_INTERVAL_MS);
+  }
+
+  private stopRecentMessageScanner(): void {
+    if (!this.recentMessageScanTimer) return;
+    clearInterval(this.recentMessageScanTimer);
+    this.recentMessageScanTimer = null;
+  }
+
+  private async scanRecentMessages(): Promise<void> {
+    const client = this.client;
+    if (!client || this.status !== EngineStatus.READY) return;
+
+    const scanSinceTimestamp = Math.floor(Date.now() / 1000) - RECENT_MESSAGE_SCAN_LOOKBACK_SECONDS;
+
+    try {
+      const chats = (await client.getChats()) as WWebChat[];
+      const recentChats = chats
+        .filter(chat => this.shouldScanRecentChat(chat, scanSinceTimestamp))
+        .sort((left, right) => right.timestamp - left.timestamp)
+        .slice(0, MAX_RECENT_MESSAGE_SCAN_CHATS);
+      let recoveredCount = 0;
+
+      for (const chat of recentChats) {
+        const unreadCount = Math.max(chat.unreadCount ?? 0, 0);
+        const limit = Math.min(Math.max(unreadCount, 1), MAX_RECENT_MESSAGE_SCAN_MESSAGES_PER_CHAT);
+        const messages = await chat.fetchMessages({ limit });
+
+        for (const msg of messages) {
+          if (msg.fromMe || msg.timestamp < scanSinceTimestamp) continue;
+          if (await this.emitIncomingMessage(msg, 'recent_message_scan')) {
+            recoveredCount += 1;
+          }
+        }
+      }
+
+      if (recoveredCount > 0) {
+        this.logger.log('Recovered recent WhatsApp messages from scan', {
+          sessionId: this.config.sessionId,
+          count: recoveredCount,
+          scannedChats: recentChats.length,
+          action: 'recent_message_scan',
+        });
+      }
+    } catch (error) {
+      this.logger.warn('Recent WhatsApp message scan failed', {
+        sessionId: this.config.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+        action: 'recent_message_scan_failed',
+      });
+    }
+  }
+
+  private shouldScanRecentChat(chat: WWebChat, scanSinceTimestamp: number): boolean {
+    const chatId = chat.id?._serialized;
+    if (!chatId || chatId === 'status@broadcast' || chatId.endsWith('@newsletter')) return false;
+
+    return chat.unreadCount > 0 || chat.timestamp >= scanSinceTimestamp;
+  }
+
+  private shouldRecoverUnreadChat(chat: WWebChat): boolean {
+    if (chat.unreadCount <= 0) return false;
+    const chatId = chat.id?._serialized;
+    return Boolean(chatId && chatId !== 'status@broadcast');
+  }
+
+  private rememberIncomingMessage(messageId?: string): boolean {
+    if (!messageId) return true;
+    if (this.processedIncomingMessageIds.has(messageId)) return false;
+
+    this.processedIncomingMessageIds.add(messageId);
+    if (this.processedIncomingMessageIds.size > MAX_PROCESSED_MESSAGE_IDS) {
+      const oldest = this.processedIncomingMessageIds.values().next().value as string | undefined;
+      if (oldest) this.processedIncomingMessageIds.delete(oldest);
+    }
+    return true;
+  }
+
   async disconnect(): Promise<void> {
+    this.clearReadyRecoveryTimers();
+    this.stopRecentMessageScanner();
+    this.readyEmitted = false;
     if (this.client) {
       try {
         // Use destroy instead of logout to preserve session data
@@ -227,6 +704,9 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   }
 
   async logout(): Promise<void> {
+    this.clearReadyRecoveryTimers();
+    this.stopRecentMessageScanner();
+    this.readyEmitted = false;
     if (this.client) {
       try {
         // Logout clears session data - user will need to scan QR again
@@ -246,11 +726,53 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   }
 
   async destroy(): Promise<void> {
+    this.clearReadyRecoveryTimers();
+    this.stopRecentMessageScanner();
+    this.readyEmitted = false;
     if (this.client) {
       await this.client.destroy();
       this.client = null;
       this.setStatus(EngineStatus.DISCONNECTED);
     }
+  }
+
+  private async resolveMessageContactIds(msg: WWebMessage): Promise<string[]> {
+    const ids = new Set<string>();
+    const addId = (id?: string | null): void => {
+      if (id?.trim()) ids.add(id.trim().toLowerCase());
+    };
+
+    addId(msg.from);
+    addId(msg.author);
+
+    try {
+      const contact = await msg.getContact();
+      addId(contact.id?._serialized);
+      if (contact.number) addId(`${contact.number}@c.us`);
+    } catch (error) {
+      this.logger.debug('Unable to resolve message contact details', {
+        messageId: msg.id?._serialized,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    const client = this.client as BusinessClient | null;
+    if (client?.getContactLidAndPhone && ids.size > 0) {
+      try {
+        const resolvedIds = await client.getContactLidAndPhone([...ids]);
+        for (const resolved of resolvedIds) {
+          addId(resolved.lid);
+          addId(resolved.pn);
+        }
+      } catch (error) {
+        this.logger.debug('Unable to resolve LID and phone identifiers', {
+          messageId: msg.id?._serialized,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    return [...ids];
   }
 
   getStatus(): EngineStatus {
@@ -271,11 +793,52 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   async sendTextMessage(chatId: string, text: string): Promise<MessageResult> {
     this.ensureReady();
-    const msg = await this.client!.sendMessage(chatId, text);
-    return {
+    this.logger.log('WhatsApp sendTextMessage starting', {
+      sessionId: this.config.sessionId,
+      chatId,
+      textLength: text.length,
+      action: 'whatsapp_send_text_start',
+    });
+    const msg = await this.sendMessageWithCompatibilityRetry(chatId, text);
+    this.logger.log('WhatsApp sendTextMessage returned', {
+      sessionId: this.config.sessionId,
+      chatId,
+      messageId: msg.id?._serialized,
+      timestamp: msg.timestamp,
+      ack: msg.ack,
+      from: msg.from,
+      to: msg.to,
+      fromMe: msg.fromMe,
+      action: 'whatsapp_send_text_result',
+    });
+    const result: MessageResult = {
       id: msg.id._serialized,
       timestamp: msg.timestamp,
     };
+    if (msg.ack !== undefined) result.ack = msg.ack;
+    return result;
+  }
+
+  private async sendMessageWithCompatibilityRetry(
+    chatId: string,
+    content: MessageContent,
+    options?: MessageSendOptions,
+  ): Promise<WWebMessage> {
+    try {
+      return await this.client!.sendMessage(chatId, content, options);
+    } catch (error) {
+      if (!this.isSendMessageCompatibilityError(error)) {
+        throw error;
+      }
+
+      this.logger.warn('WhatsApp Web sendMessage compatibility patch required', {
+        sessionId: this.config.sessionId,
+        chatId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      await this.patchClientRuntimeCompatibility();
+      return this.client!.sendMessage(chatId, content, options);
+    }
   }
 
   async sendImageMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
@@ -312,7 +875,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       messageMedia = new MessageMedia(media.mimetype, media.data.toString('base64'), media.filename);
     }
 
-    const msg = await this.client!.sendMessage(chatId, messageMedia, {
+    const msg = await this.sendMessageWithCompatibilityRetry(chatId, messageMedia, {
       caption: media.caption,
     });
 
@@ -390,7 +953,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       name: location.description || '',
       address: location.address || '',
     });
-    const msg = await this.client!.sendMessage(chatId, loc);
+    const msg = await this.sendMessageWithCompatibilityRetry(chatId, loc);
     return {
       id: msg.id._serialized,
       timestamp: msg.timestamp,
@@ -408,7 +971,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       'END:VCARD',
     ].join('\n');
 
-    const msg = await this.client!.sendMessage(chatId, vcard, {
+    const msg = await this.sendMessageWithCompatibilityRetry(chatId, vcard, {
       parseVCards: true,
     });
     return {
@@ -431,7 +994,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       messageMedia = new MessageMedia(media.mimetype, media.data.toString('base64'), media.filename);
     }
 
-    const msg = await this.client!.sendMessage(chatId, messageMedia, {
+    const msg = await this.sendMessageWithCompatibilityRetry(chatId, messageMedia, {
       sendMediaAsSticker: true,
     });
     return {

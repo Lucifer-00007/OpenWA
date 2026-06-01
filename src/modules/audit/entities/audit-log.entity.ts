@@ -26,6 +26,19 @@ export enum AuditAction {
   WEBHOOK_DELETED = 'webhook_deleted',
   WEBHOOK_TRIGGERED = 'webhook_triggered',
   WEBHOOK_FAILED = 'webhook_failed',
+
+  // Automation events
+  AUTOMATION_PROVIDER_CREATED = 'automation_provider_created',
+  AUTOMATION_PROVIDER_UPDATED = 'automation_provider_updated',
+  AUTOMATION_PROVIDER_DELETED = 'automation_provider_deleted',
+  AUTOMATION_PROVIDER_TESTED = 'automation_provider_tested',
+  AUTOMATION_RULE_CREATED = 'automation_rule_created',
+  AUTOMATION_RULE_UPDATED = 'automation_rule_updated',
+  AUTOMATION_RULE_DELETED = 'automation_rule_deleted',
+  AUTOMATION_RULE_ENABLED = 'automation_rule_enabled',
+  AUTOMATION_RULE_DISABLED = 'automation_rule_disabled',
+  AUTOMATION_REPLY_SENT = 'automation_reply_sent',
+  AUTOMATION_REPLY_FAILED = 'automation_reply_failed',
 }
 
 export enum AuditSeverity {
