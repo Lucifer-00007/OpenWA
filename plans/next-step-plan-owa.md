@@ -66,8 +66,8 @@
 	- the corrected behavior rules,
 	- and a polished example reply style guide.
 
+- [] Avoid auto replying to business accounts.
 
-- []
 - []
 - []
 - []

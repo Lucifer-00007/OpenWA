@@ -33,6 +33,7 @@ export interface IncomingMessage {
   timestamp: number;
   fromMe: boolean;
   isGroup: boolean;
+  isBusiness?: boolean;
   media?: {
     mimetype: string;
     filename?: string;

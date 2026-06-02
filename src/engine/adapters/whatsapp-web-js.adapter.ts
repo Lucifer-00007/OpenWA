@@ -496,6 +496,17 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     if (!this.rememberIncomingMessage(msg.id?._serialized)) return false;
 
     try {
+      let isBusiness = false;
+      try {
+        const contact = await msg.getContact();
+        isBusiness = contact?.isBusiness === true;
+      } catch (error) {
+        this.logger.debug('Unable to fetch contact for isBusiness check', {
+          messageId: msg.id?._serialized,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+
       const incomingMessage: IncomingMessage = {
         id: msg.id._serialized,
         from: msg.from,
@@ -507,6 +518,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         timestamp: msg.timestamp,
         fromMe: msg.fromMe,
         isGroup: msg.from.endsWith('@g.us'),
+        isBusiness,
       };
 
       this.logger.log('WhatsApp incoming message normalized', {
@@ -520,6 +532,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         type: incomingMessage.type,
         bodyLength: incomingMessage.body?.length ?? 0,
         isGroup: incomingMessage.isGroup,
+        isBusiness: incomingMessage.isBusiness,
         action: 'whatsapp_incoming_message_normalized',
       });
 

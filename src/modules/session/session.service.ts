@@ -348,6 +348,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
                   timestamp?: number;
                   fromMe?: boolean;
                   isGroup?: boolean;
+                  isBusiness?: boolean;
                 },
                 async (chatId, text) => {
                   const activeEngine = this.engines.get(id);

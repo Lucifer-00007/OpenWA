@@ -8,6 +8,9 @@ export enum AutomationRunStatus {
   DUPLICATE = 'duplicate',
   COOLDOWN = 'cooldown',
   PROVIDER_TIMEOUT = 'provider_timeout',
+  STALE = 'stale',
+  RATE_LIMITED = 'rate_limited',
+  QUEUE_FULL = 'queue_full',
 }
 
 @Entity('automation_runs')
